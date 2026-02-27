@@ -1,0 +1,109 @@
+from fastapi import FastAPI, HTTPException
+from pydantic import BaseModel
+from typing import List, Dict, Any
+from openai import OpenAI
+from sentence_transformers import SentenceTransformer, util
+import numpy as np
+import os
+import json
+
+app = FastAPI(title="Economic Mobility MVP")
+
+# ─── Clients & Models ───────────────────────────────────────
+# IMPORTANT: NEVER hardcode the API key in source code!
+# Use environment variable only (set in Render / .env / etc.)
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+if not GEMINI_API_KEY:
+    raise ValueError("GEMINI_API_KEY environment variable is not set!")
+
+client = OpenAI(
+    api_key=GEMINI_API_KEY,
+    base_url="https://generativelanguage.googleapis.com/v1beta/openai/"
+)
+
+embedder = SentenceTransformer('all-MiniLM-L6-v2')
+
+# Mock jobs (expand later)
+SAMPLE_JOBS = [
+    {"name": "Freelance Content Writer", "required_skills": ["writing", "research", "SEO"], "risk_level": "medium", "stability_score": 6, "growth_potential": "medium"},
+    {"name": "Delivery Driver (Gig Economy)", "required_skills": ["driving", "navigation", "customer service"], "risk_level": "high", "stability_score": 4, "growth_potential": "low"},
+    {"name": "Online Tutor", "required_skills": ["teaching", "subject knowledge", "communication"], "risk_level": "low", "stability_score": 8, "growth_potential": "high"},
+    {"name": "Virtual Assistant", "required_skills": ["organization", "communication", "basic tech"], "risk_level": "medium", "stability_score": 7, "growth_potential": "medium"},
+    {"name": "E-commerce Seller", "required_skills": ["sales", "inventory management", "digital marketing"], "risk_level": "high", "stability_score": 5, "growth_potential": "high"},
+]
+
+JOB_EMBEDDINGS = [embedder.encode(", ".join(j["required_skills"])) for j in SAMPLE_JOBS]
+
+class UserInput(BaseModel):
+    background: str
+    past_work: str
+    skills_known: str
+    interests: str
+    learning_comfort: str
+    challenges: str
+
+@app.post("/analyze-user")
+async def analyze_user(input: UserInput):
+    data = input.dict()
+
+    # Skill extraction (using JSON mode — reliable on recent Gemini models)
+    try:
+        prompt = f"""Extract skills from this user profile:
+Background: {data['background']}
+Past work: {data['past_work']}
+Known skills: {data['skills_known']}
+Interests: {data['interests']}
+Challenges: {data['challenges']}
+
+Return ONLY valid JSON. No other text. Example format:
+{{"hard_skills": ["skill1", "skill2"], "soft_skills": ["skill3"], "digital_readiness": "medium"}}"""
+        
+        resp = client.chat.completions.create(
+            model="gemini-1.5-flash",               # ← changed: use a real Gemini model
+            # Alternative good options in Feb 2026:
+            # "gemini-2.0-flash"   ← very fast & cheap
+            # "gemini-1.5-pro"     ← better quality
+            # "gemini-2.5-flash"   ← if available in your region/project
+            messages=[{"role": "user", "content": prompt}],
+            response_format={"type": "json_object"},
+            temperature=0.2,
+            max_tokens=400
+        )
+        
+        content = resp.choices[0].message.content.strip()
+        skills = json.loads(content)
+        
+        # Basic validation / fallback
+        if not isinstance(skills, dict):
+            raise ValueError("Invalid JSON structure")
+        
+    except Exception as e:
+        # Log in production: print(e) or use logging
+        skills = {"hard_skills": [], "soft_skills": [], "digital_readiness": "medium"}
+
+    user_skills = skills.get("hard_skills", []) + skills.get("soft_skills", [])
+    if not user_skills:
+        user_skills = ["communication"]  # minimal fallback
+
+    user_emb = embedder.encode(", ".join(user_skills))
+
+    # Simple top-3 match by cosine similarity
+    sims = [util.cos_sim(user_emb, je)[0][0].item() for je in JOB_EMBEDDINGS]
+    top_idx = np.argsort(sims)[-3:][::-1]
+
+    opportunities = []
+    for i in top_idx:
+        if sims[i] > 0.25:
+            job = SAMPLE_JOBS[i]
+            opportunities.append({
+                "name": job["name"],
+                "match_score": round(sims[i], 2),
+                "stability": job["stability_score"],
+                "risk": job["risk_level"]
+            })
+
+    return {
+        "skill_profile": skills,
+        "top_opportunities": opportunities,
+        "note": "Powered by Gemini via OpenAI-compatible endpoint. Tell me what to improve!"
+    }
